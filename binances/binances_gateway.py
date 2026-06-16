@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from threading import Lock
+from types import TracebackType
 from time import sleep, time
 import re
 from typing import Any, Callable, Dict, List, Sequence, Tuple,Union
@@ -45,7 +46,6 @@ from vnpy.trader.setting import binance_account_main  # 导入账户字典
 from vnpy.trader.utility import (
     TZ_INFO,
     GetFilePath,
-    delete_dr_data,
     extract_vt_symbol,
     get_folder_path,
     get_local_datetime,
@@ -144,9 +144,11 @@ class BinancesGateway(BaseGateway):
         self.history_contract = copy(self.recording_list)
         self.leverage_contract = copy(self.recording_list)
         self.query_count = 0
-        self.query_functions = [self.query_account, self.query_position, self.query_order]
+        self.query_functions = [self.query_account, self.query_position, self.query_order,self.rest_api.query_time]
         # 下载历史数据状态
-        self.history_status: bool = True
+        self.history_status = True
+        # 识别mmap发布进程状态
+        self.publish_status = True
         # 订阅成交数据状态
         self.book_trade_status: bool = False
     # -------------------------------------------------------------------------------------------------------
@@ -194,10 +196,9 @@ class BinancesGateway(BaseGateway):
         rest api定时查询账户,委托单和持仓
         """
         self.query_count += 1
-        if self.query_count < 5:
+        if self.query_count < 6:
             return
         self.query_count = 0
-        self.rest_api.query_time()
         func = self.query_functions.pop(0)
         func()
         self.query_functions.append(func)
@@ -213,10 +214,10 @@ class BinancesGateway(BaseGateway):
             symbol=symbol,
             exchange=Exchange(exchange),
             interval=Interval.MINUTE,
-            start=datetime.now(TZ_INFO) - timedelta(minutes=1440),
+            start=datetime.now(TZ_INFO) - timedelta(minutes=1440 * 5),
             end=datetime.now(TZ_INFO),
-            #start=datetime(2026,1,31,tzinfo=TZ_INFO),
-            #end=datetime(2026,4,16,tzinfo=TZ_INFO),
+            #start=datetime(2026,4,15,tzinfo=TZ_INFO),
+            #end=datetime(2026,5,27,tzinfo=TZ_INFO),
             gateway_name=self.gateway_name,
         )
         self.rest_api.query_history(req)
@@ -339,6 +340,7 @@ class BinancesRestApi(RestClient):
         self.start()
         self.gateway.write_log(f"交易接口：{self.gateway_name}，REST API启动成功")
 
+        # mmap发布进程和订阅进程都必须获取合约数据，有的交易所发送委托单需要合约数据
         self.query_contract()
         self.set_position_side()
         self.start_user_stream()
@@ -378,7 +380,7 @@ class BinancesRestApi(RestClient):
         symbol: str = request.extra["symbol"]
         # -1122错误设置杠杆合约为过期合约，从dr_data中删除
         if error_code == -1122:
-            delete_dr_data(symbol, self.gateway_name)
+            self.gateway.get_file_path.delete_dr_data(symbol, self.gateway_name)
     # -------------------------------------------------------------------------------------------------------
     def set_position_side(self):
         """
@@ -508,10 +510,10 @@ class BinancesRestApi(RestClient):
     # -------------------------------------------------------------------------------------------------------
     def keep_user_stream(self) -> Request:
         """
-        保持listenKey连接
+        保持listenKey连接，listenKey有效期为600秒，在590秒后延长有效期
         """
         self.keep_alive_count += 1
-        if self.keep_alive_count < 600:
+        if self.keep_alive_count < 590:
             return
         self.keep_alive_count = 0
         data = {"security": Security.API_KEY}
@@ -522,13 +524,13 @@ class BinancesRestApi(RestClient):
             method="PUT", path="/fapi/v1/listenKey", callback=self.on_keep_user_stream, params=params, data=data, on_error=self.on_keep_user_stream_error
         )
     # -------------------------------------------------------------------------------------------------------
-    def on_keep_user_stream_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+    def on_keep_user_stream_error(self, exception_type: type, exception_value: Exception, trace_back, request: Request) -> None:
         """
         收到keep_user_stream错误回报
         """
         # 处理非超时错误
         if not issubclass(exception_type, TimeoutError):
-            self.on_error(exception_type, exception_value, tb, request)
+            self.on_error(exception_type, exception_value, trace_back, request)
     # -------------------------------------------------------------------------------------------------------
     def on_query_time(self, data, request: Request) -> None:
         """
@@ -687,7 +689,7 @@ class BinancesRestApi(RestClient):
                 exchange=Exchange.BINANCES,
                 name=remain_alpha(raw_data["symbol"]),
                 price_tick=price_tick,
-                size=20,  # 默认杠杆
+                size=1,  # 合约下单委托量转化为币的数量
                 min_volume=min_volume,
                 max_volume=max_volume,
                 product=Product.FUTURES,
@@ -711,17 +713,16 @@ class BinancesRestApi(RestClient):
         msg = f"委托失败，状态码：{status_code}，信息：{request.response.text}，错误委托单：{order}"
         self.gateway.write_log(msg)
     # -------------------------------------------------------------------------------------------------------
-    def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+    def on_send_order_error(self, exception_type: type, exception_value: Exception, trace_back: TracebackType, request: Request) -> None:
         """
         收到发送委托单错误回报
         """
         order = request.extra
         order.status = Status.REJECTED
         self.gateway.on_order(order)
-
         # Record exception if not ConnectionError
         if not issubclass(exception_type, (ConnectionError, SSLError)):
-            self.on_error(exception_type, exception_value, tb, request)
+            self.on_error(exception_type, exception_value, trace_back, request)
     # -------------------------------------------------------------------------------------------------------
     def on_cancel_order(self, data, request: Request) -> None:
         """
@@ -822,7 +823,6 @@ class BinancesRestApi(RestClient):
         else:
             msg = f"未获取到标的：{req.vt_symbol}历史数据"
             self.gateway.write_log(msg)
-            delete_dr_data(req.symbol, self.gateway_name)
 # -------------------------------------------------------------------------------------------------------
 class BinancesTradeWebsocketApi(WebsocketClient):
     """ """
@@ -971,8 +971,10 @@ class BinancesDataWebsocketApi:
         """
         self.subscribed[req.vt_symbol] = req
         self.init_tick(req)
-        self.public_ws_api.subscribe(req)
-        self.market_ws_api.subscribe(req)
+        # 只有mmap发布进程才订阅行情数据
+        if self.gateway.publish_status:
+            self.public_ws_api.subscribe(req)
+            self.market_ws_api.subscribe(req)
     # -------------------------------------------------------------------------------------------------------
     def init_tick(self, req: SubscribeRequest) -> TickData:
         """初始化tick"""
@@ -999,6 +1001,7 @@ class BinancesDataWebsocketApi:
         tick.low_price = float(data["l"])
         tick.last_price = float(data["c"])
         tick.datetime = get_local_datetime(int(data["E"]))
+        self.gateway.on_tick(copy(tick))
     # -------------------------------------------------------------------------------------------------------
     def on_depth(self, data: dict) -> None:
         """
@@ -1006,6 +1009,7 @@ class BinancesDataWebsocketApi:
         """
         symbol = data["s"]
         tick = self.ticks[symbol]
+        tick.datetime = get_local_datetime(data["T"])
         bids = data["b"]
         asks = data["a"]
         # 提取前5个最佳买入价格和量，并为tick对象设置属性
@@ -1032,7 +1036,7 @@ class BinancesDataWebsocketApi:
         """
         symbol = data["s"]
         tick = self.ticks[symbol]
-        tick.datetime = get_local_datetime(int(data["E"]))
+        tick.datetime = get_local_datetime(int(data["T"]))
         tick.bid_price_1, tick.bid_volume_1 = float(data["b"]), float(data["B"])
         tick.ask_price_1, tick.ask_volume_1 = float(data["a"]), float(data["A"])
         if tick.last_price:
@@ -1046,7 +1050,7 @@ class BinancesDataWebsocketApi:
         tick = self.ticks[symbol]
         tick.datetime = get_local_datetime(int(data["T"]))
         tick.last_price = float(data["p"])
-
+        self.gateway.on_tick(copy(tick))
 
 class BinancesDataWebsocketBase(WebsocketClient):
     """Binance 公共行情 websocket 基类。"""
