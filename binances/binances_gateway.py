@@ -216,8 +216,8 @@ class BinancesGateway(BaseGateway):
             interval=Interval.MINUTE,
             start=datetime.now(TZ_INFO) - timedelta(minutes=1440 * 5),
             end=datetime.now(TZ_INFO),
-            #start=datetime(2026,4,15,tzinfo=TZ_INFO),
-            #end=datetime(2026,5,27,tzinfo=TZ_INFO),
+            #start=datetime(2026,5,16,tzinfo=TZ_INFO),
+            #end=datetime(2026,6,27,tzinfo=TZ_INFO),
             gateway_name=self.gateway_name,
         )
         self.rest_api.query_history(req)
@@ -548,7 +548,7 @@ class BinancesRestApi(RestClient):
             account = AccountData(
                 accountid=asset["asset"] + "_" + self.gateway_name,
                 balance=float(asset["walletBalance"]),
-                frozen=float(asset["maintMargin"]),
+                frozen=float(asset["initialMargin"]),
                 margin=float(asset["positionInitialMargin"]),
                 position_profit=float(asset["unrealizedProfit"]),
                 available=float(asset["availableBalance"]),
@@ -1145,7 +1145,7 @@ class BinancesPublicWebsocketApi(BinancesDataWebsocketBase):
         symbol_lower = req.symbol.lower()
         return [
             symbol_lower + "@depth5@100ms",
-            # symbol_lower + "@bookTicker",  # 逐笔一档深度(订阅该主题ws行情会不断断开重连，暂不使用)
+            # symbol_lower + "@bookTicker",  # 逐笔一档深度
         ]
     # -------------------------------------------------------------------------------------------------------
     def on_packet(self, packet: dict) -> None:
